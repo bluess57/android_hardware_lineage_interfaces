@@ -15,6 +15,8 @@
  */
 
 #define LOG_TAG "CamDev@1.0-impl.legacy"
+#define USE_MEMORY_HEAP_ION
+
 #include <hardware/camera.h>
 #include <hardware/gralloc1.h>
 #include <hidlmemory/mapping.h>
@@ -23,6 +25,10 @@
 
 #include <media/hardware/HardwareAPI.h> // For VideoNativeHandleMetadata
 #include "CameraDevice_1_0.h"
+
+#ifdef USE_MEMORY_HEAP_ION
+#include <binder/MemoryHeapIon.h>
+#endif
 
 namespace android {
 namespace hardware {
@@ -93,6 +99,7 @@ CameraDevice::CameraDevice(
         mCameraId(cameraId),
         mDisconnected(false),
         mCameraDeviceNames(cameraDeviceNames) {
+
     mCameraIdInt = atoi(mCameraId.c_str());
     // Should not reach here as provider also validate ID
     if (mCameraIdInt < 0 || mCameraIdInt >= module->getNumberOfCameras()) {
@@ -107,11 +114,15 @@ CameraDevice::CameraDevice(
         mInitFail = true;
     }
 
+#ifdef USE_MEMORY_HEAP_ION
+
+#else
     mAshmemAllocator = IAllocator::getService("ashmem");
     if (mAshmemAllocator == nullptr) {
         ALOGI("%s: cannot get ashmemAllocator", __FUNCTION__);
         mInitFail = true;
     }
+#endif
 }
 
 CameraDevice::~CameraDevice() {
@@ -302,21 +313,42 @@ CameraDevice::CameraHeapMemory::CameraHeapMemory(
     int fd, size_t buf_size, uint_t num_buffers) :
         mBufSize(buf_size),
         mNumBufs(num_buffers) {
+
     mHidlHandle = native_handle_create(1,0);
     mHidlHandle->data[0] = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+
+#ifdef USE_MEMORY_HEAP_ION
+    mIonHeap = new MemoryHeapIon(fd, buf_size * num_buffers);
+#else
     const size_t pagesize = getpagesize();
     size_t size = ((buf_size * num_buffers + pagesize-1) & ~(pagesize-1));
     mHidlHeap = hidl_memory("ashmem", mHidlHandle, size);
+#endif
+
     commonInitialization();
 }
 
+#ifdef USE_MEMORY_HEAP_ION
+CameraDevice::CameraHeapMemory::CameraHeapMemory(    
+    size_t buf_size, uint_t num_buffers) :
+        mBufSize(buf_size),
+        mNumBufs(num_buffers) {
+
+    mIonHeap = new MemoryHeapIon(buf_size * num_buffers);
+    mHidlHandle = native_handle_create(1,0);
+    mHidlHandle->data[0] = mIonHeap->getHeapID();
+    ALOGD("%s ion mHidlHandle %d",__FUNCTION__, mHidlHandle->data[0]);
+#else
 CameraDevice::CameraHeapMemory::CameraHeapMemory(
     sp<IAllocator> ashmemAllocator,
     size_t buf_size, uint_t num_buffers) :
         mBufSize(buf_size),
         mNumBufs(num_buffers) {
+
     const size_t pagesize = getpagesize();
+
     size_t size = ((buf_size * num_buffers + pagesize-1) & ~(pagesize-1));
+
     ashmemAllocator->allocate(size,
         [&](bool success, const hidl_memory& mem) {
             if (!success) {
@@ -327,11 +359,17 @@ CameraDevice::CameraHeapMemory::CameraHeapMemory(
             mHidlHandle = native_handle_clone(mem.handle());
             mHidlHeap = hidl_memory("ashmem", mHidlHandle, size);
         });
+#endif
 
     commonInitialization();
 }
 
 void CameraDevice::CameraHeapMemory::commonInitialization() {
+#ifdef USE_MEMORY_HEAP_ION
+    
+    mHidlHeapMemData = mIonHeap->getBase();
+
+#else
     mHidlHeapMemory = mapMemory(mHidlHeap);
     if (mHidlHeapMemory == nullptr) {
         ALOGE("%s: memory map failed!", __FUNCTION__);
@@ -342,6 +380,8 @@ void CameraDevice::CameraHeapMemory::commonInitialization() {
         return;
     }
     mHidlHeapMemData = mHidlHeapMemory->getPointer();
+#endif
+
     handle.data = mHidlHeapMemData;
     handle.size = mBufSize * mNumBufs;
     handle.handle = this;
@@ -363,7 +403,7 @@ CameraDevice::CameraHeapMemory::~CameraHeapMemory() {
 // shared memory methods
 camera_memory_t* CameraDevice::sGetMemory(int fd, size_t buf_size, uint_t num_bufs,
         void *user __unused) {
-    ALOGV("%s", __FUNCTION__);
+
     CameraDevice* object = sCameraDevice;
     if (object->mDeviceCallback == nullptr) {
         ALOGE("%s: camera HAL request memory while camera is not opened!", __FUNCTION__);
@@ -371,15 +411,35 @@ camera_memory_t* CameraDevice::sGetMemory(int fd, size_t buf_size, uint_t num_bu
     }
 
     CameraHeapMemory* mem;
+
+#ifdef USE_MEMORY_HEAP_ION
+    
+    if (fd < 0) {
+        mem = new CameraHeapMemory(buf_size, num_bufs);
+    } else {
+        mem = new CameraHeapMemory(fd, buf_size, num_bufs);
+    }
+
+    int id = mem->mIonHeap->getHeapID(); // fd of the ion alloc memory
+//    mem->handle.mId = id;
+   *((int *) user) = id;   // libexynoscamera requires the fd to be sent back
+
+    mem->incStrong(mem);
+    hidl_handle hidlHandle = mem->mHidlHandle;
+    MemoryId memId = object->mDeviceCallback->registerMemory(hidlHandle, buf_size, num_bufs);
+    mem->handle.mId = memId;
+#else
     if (fd < 0) {
         mem = new CameraHeapMemory(object->mAshmemAllocator, buf_size, num_bufs);
     } else {
-        mem = new CameraHeapMemory(fd, buf_size, num_bufs);
+            mem = new CameraHeapMemory(fd, buf_size, num_bufs);
     }
     mem->incStrong(mem);
     hidl_handle hidlHandle = mem->mHidlHandle;
     MemoryId id = object->mDeviceCallback->registerMemory(hidlHandle, buf_size, num_bufs);
     mem->handle.mId = id;
+#endif
+
     {
         Mutex::Autolock _l(object->mMemoryMapLock);
         if (object->mMemoryMap.count(id) != 0) {
@@ -387,6 +447,7 @@ camera_memory_t* CameraDevice::sGetMemory(int fd, size_t buf_size, uint_t num_bu
         }
         object->mMemoryMap[id] = mem;
     }
+
     mem->handle.mDevice = object;
     return &mem->handle;
 }
@@ -422,14 +483,17 @@ void CameraDevice::sNotifyCb(int32_t msg_type, int32_t ext1, int32_t ext2, void 
 
 void CameraDevice::sDataCb(int32_t msg_type, const camera_memory_t *data, unsigned int index,
         camera_frame_metadata_t *metadata, void *user __unused) {
-    ALOGV("%s", __FUNCTION__);
+
     CameraDevice* object = sCameraDevice;
+
     sp<CameraHeapMemory> mem(static_cast<CameraHeapMemory*>(data->handle));
+
     if (index >= mem->mNumBufs) {
         ALOGE("%s: invalid buffer index %d, max allowed is %d", __FUNCTION__,
              index, mem->mNumBufs);
         return;
     }
+
     if (object->mDeviceCallback != nullptr) {
         CameraFrameMetadata hidlMetadata;
         if (metadata) {
@@ -451,9 +515,9 @@ void CameraDevice::sDataCb(int32_t msg_type, const camera_memory_t *data, unsign
                 }
             }
         }
-        CameraHeapMemory* mem = static_cast<CameraHeapMemory *>(data->handle);
+
         object->mDeviceCallback->dataCallback(
-                (DataCallbackMsg) msg_type, mem->handle.mId, index, hidlMetadata);
+                        (DataCallbackMsg) msg_type, mem->handle.mId, index, hidlMetadata);
     }
 }
 
